@@ -3,6 +3,8 @@ const express = require("express");
 const { Pool } = require("pg");
 const { v4: uuidv4 } = require("uuid");
 const cors = require("cors");
+const http = require("http");
+const WebSocket = require("ws");
 
 const app = express();
 app.use(express.json());
@@ -16,7 +18,24 @@ const pool = new Pool({
   connectionString: DATABASE_URL,
 });
 
-// Create documents table if not exists
+// Create HTTP server
+const server = http.createServer(app);
+
+// Create WebSocket server
+const wss = new WebSocket.Server({ server });
+
+// In-memory document sessions
+const sessions = {}; 
+// structure:
+// {
+//   documentId: {
+//     content: "",
+//     version: 0,
+//     clients: Map<ws, { userId, username }>
+//   }
+// }
+
+// Initialize DB
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS documents (
@@ -29,7 +48,7 @@ async function initDB() {
   console.log("Database initialized");
 }
 
-// Health check endpoint
+// Health check
 app.get("/health", (req, res) => {
   res.status(200).json({ status: "OK" });
 });
@@ -47,12 +66,7 @@ app.post("/api/documents", async (req, res) => {
       [id, title, content, 0]
     );
 
-    res.status(201).json({
-      id,
-      title,
-      content,
-      version: 0,
-    });
+    res.status(201).json({ id, title, content, version: 0 });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Internal Server Error" });
@@ -65,12 +79,11 @@ app.get("/api/documents", async (req, res) => {
     const result = await pool.query("SELECT id, title FROM documents");
     res.status(200).json(result.rows);
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
-// Get Document by ID
+// Get Document
 app.get("/api/documents/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -85,7 +98,6 @@ app.get("/api/documents/:id", async (req, res) => {
 
     res.status(200).json(result.rows[0]);
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: "Internal Server Error" });
   }
 });
@@ -106,14 +118,98 @@ app.delete("/api/documents/:id", async (req, res) => {
 
     res.status(204).send();
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
+// ---------------- WebSocket Logic ----------------
+
+wss.on("connection", (ws) => {
+  ws.on("message", async (message) => {
+    try {
+      const data = JSON.parse(message);
+
+      // JOIN
+      if (data.type === "JOIN") {
+        const { documentId, userId, username } = data;
+
+        // Load document if not in memory
+        if (!sessions[documentId]) {
+          const result = await pool.query(
+            "SELECT * FROM documents WHERE id = $1",
+            [documentId]
+          );
+
+          if (result.rows.length === 0) {
+            ws.send(JSON.stringify({ error: "Document not found" }));
+            return;
+          }
+
+          sessions[documentId] = {
+            content: result.rows[0].content,
+            version: result.rows[0].version,
+            clients: new Map(),
+          };
+        }
+
+        // Add client
+        sessions[documentId].clients.set(ws, { userId, username });
+        ws.documentId = documentId;
+
+        // Send INIT to joining client
+        ws.send(
+          JSON.stringify({
+            type: "INIT",
+            content: sessions[documentId].content,
+            version: sessions[documentId].version,
+            users: Array.from(
+              sessions[documentId].clients.values()
+            ),
+          })
+        );
+
+        // Broadcast USER_JOINED to others
+        sessions[documentId].clients.forEach((client, clientWs) => {
+          if (clientWs !== ws) {
+            clientWs.send(
+              JSON.stringify({
+                type: "USER_JOINED",
+                userId,
+                username,
+              })
+            );
+          }
+        });
+      }
+    } catch (err) {
+      console.error("WebSocket error:", err);
+    }
+  });
+
+  ws.on("close", () => {
+    const documentId = ws.documentId;
+    if (!documentId || !sessions[documentId]) return;
+
+    const user = sessions[documentId].clients.get(ws);
+    sessions[documentId].clients.delete(ws);
+
+    if (user) {
+      sessions[documentId].clients.forEach((_, clientWs) => {
+        clientWs.send(
+          JSON.stringify({
+            type: "USER_LEFT",
+            userId: user.userId,
+            username: user.username,
+          })
+        );
+      });
+    }
+  });
+});
+
 // Start server
 initDB().then(() => {
-  app.listen(PORT, () => {
+  server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
   });
 });
