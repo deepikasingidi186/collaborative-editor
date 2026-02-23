@@ -24,14 +24,15 @@ const server = http.createServer(app);
 // Create WebSocket server
 const wss = new WebSocket.Server({ server });
 
-// In-memory document sessions
-const sessions = {}; 
-// structure:
+// In-memory sessions
+const sessions = {};
+// Structure:
 // {
 //   documentId: {
-//     content: "",
-//     version: 0,
-//     clients: Map<ws, { userId, username }>
+//     content,
+//     version,
+//     clients: Map<ws, { userId, username }>,
+//     history: []
 //   }
 // }
 
@@ -48,7 +49,8 @@ async function initDB() {
   console.log("Database initialized");
 }
 
-// Health check
+// ---------------- HEALTH ----------------
+
 app.get("/health", (req, res) => {
   res.status(200).json({ status: "OK" });
 });
@@ -122,18 +124,17 @@ app.delete("/api/documents/:id", async (req, res) => {
   }
 });
 
-// ---------------- WebSocket Logic ----------------
+// ---------------- WebSocket ----------------
 
 wss.on("connection", (ws) => {
   ws.on("message", async (message) => {
     try {
       const data = JSON.parse(message);
 
-      // JOIN
+      // -------- JOIN --------
       if (data.type === "JOIN") {
         const { documentId, userId, username } = data;
 
-        // Load document if not in memory
         if (!sessions[documentId]) {
           const result = await pool.query(
             "SELECT * FROM documents WHERE id = $1",
@@ -149,112 +150,14 @@ wss.on("connection", (ws) => {
             content: result.rows[0].content,
             version: result.rows[0].version,
             clients: new Map(),
-            history: []
+            history: [],
           };
         }
 
-        // OPERATION
-        if (data.type === "OPERATION") {
-        const { documentId, userId, operation, clientVersion } = data;
-        const session = sessions[documentId];
-        if (!session) return;
-
-        let newOp = { ...operation };
-
-        // Transform against operations that happened after clientVersion
-        for (let i = clientVersion; i < session.history.length; i++) {
-            const appliedOp = session.history[i];
-
-            // insert vs insert
-            if (newOp.type === "insert" && appliedOp.type === "insert") {
-            if (
-                newOp.position > appliedOp.position ||
-                (newOp.position === appliedOp.position &&
-                userId > appliedOp.userId)
-            ) {
-                newOp.position += appliedOp.text.length;
-            }
-            }
-
-            // insert vs delete
-            if (newOp.type === "insert" && appliedOp.type === "delete") {
-            if (newOp.position > appliedOp.position) {
-                newOp.position -= Math.min(
-                appliedOp.length,
-                newOp.position - appliedOp.position
-                );
-            }
-            }
-
-            // delete vs insert
-            if (newOp.type === "delete" && appliedOp.type === "insert") {
-            if (newOp.position >= appliedOp.position) {
-                newOp.position += appliedOp.text.length;
-            }
-            }
-
-            // delete vs delete
-            if (newOp.type === "delete" && appliedOp.type === "delete") {
-            if (newOp.position > appliedOp.position) {
-                newOp.position -= Math.min(
-                appliedOp.length,
-                newOp.position - appliedOp.position
-                );
-            }
-            }
-        }
-
-        // Apply operation
-        if (newOp.type === "insert") {
-            session.content =
-            session.content.slice(0, newOp.position) +
-            newOp.text +
-            session.content.slice(newOp.position);
-        }
-
-        if (newOp.type === "delete") {
-            session.content =
-            session.content.slice(0, newOp.position) +
-            session.content.slice(newOp.position + newOp.length);
-        }
-
-        session.version += 1;
-
-        // Save to history
-        session.history.push({
-            ...newOp,
-            userId,
-        });
-
-        // Persist to DB
-        await pool.query(
-            "UPDATE documents SET content = $1, version = $2 WHERE id = $3",
-            [session.content, session.version, documentId]
-        );
-
-        const user = session.clients.get(ws);
-
-        // Broadcast
-        session.clients.forEach((client, clientWs) => {
-            if (clientWs !== ws) {
-            clientWs.send(
-                JSON.stringify({
-                type: "OPERATION",
-                userId: user.userId,
-                username: user.username,
-                operation: newOp,
-                serverVersion: session.version,
-                })
-            );
-            }
-        });
-        }       
-
-        // Add client
         sessions[documentId].clients.set(ws, { userId, username });
         ws.documentId = documentId;
 
-        // Send INIT to joining client
+        // INIT
         ws.send(
           JSON.stringify({
             type: "INIT",
@@ -266,7 +169,7 @@ wss.on("connection", (ws) => {
           })
         );
 
-        // Broadcast USER_JOINED to others
+        // Notify others
         sessions[documentId].clients.forEach((client, clientWs) => {
           if (clientWs !== ws) {
             clientWs.send(
@@ -279,31 +182,164 @@ wss.on("connection", (ws) => {
           }
         });
       }
+
+      // -------- OPERATION (OT) --------
+      if (data.type === "OPERATION") {
+        const { documentId, userId, operation, clientVersion } = data;
+        const session = sessions[documentId];
+        if (!session) return;
+
+        let newOp = { ...operation };
+
+        for (let i = clientVersion; i < session.history.length; i++) {
+          const appliedOp = session.history[i];
+
+          // insert vs insert
+          if (newOp.type === "insert" && appliedOp.type === "insert") {
+            if (
+              newOp.position > appliedOp.position ||
+              (newOp.position === appliedOp.position &&
+                userId > appliedOp.userId)
+            ) {
+              newOp.position += appliedOp.text.length;
+            }
+          }
+
+          // insert vs delete
+          if (newOp.type === "insert" && appliedOp.type === "delete") {
+            if (newOp.position > appliedOp.position) {
+              newOp.position -= Math.min(
+                appliedOp.length,
+                newOp.position - appliedOp.position
+              );
+            }
+          }
+
+          // delete vs insert
+          if (newOp.type === "delete" && appliedOp.type === "insert") {
+            if (newOp.position >= appliedOp.position) {
+              newOp.position += appliedOp.text.length;
+            }
+          }
+
+          // delete vs delete
+          if (newOp.type === "delete" && appliedOp.type === "delete") {
+            if (newOp.position > appliedOp.position) {
+              newOp.position -= Math.min(
+                appliedOp.length,
+                newOp.position - appliedOp.position
+              );
+            }
+          }
+        }
+
+        // Apply operation
+        if (newOp.type === "insert") {
+          session.content =
+            session.content.slice(0, newOp.position) +
+            newOp.text +
+            session.content.slice(newOp.position);
+        }
+
+        if (newOp.type === "delete") {
+          session.content =
+            session.content.slice(0, newOp.position) +
+            session.content.slice(newOp.position + newOp.length);
+        }
+
+        session.version += 1;
+
+        session.history.push({
+          ...newOp,
+          userId,
+        });
+
+        await pool.query(
+          "UPDATE documents SET content = $1, version = $2 WHERE id = $3",
+          [session.content, session.version, documentId]
+        );
+
+        const user = session.clients.get(ws);
+
+        session.clients.forEach((client, clientWs) => {
+          if (clientWs !== ws) {
+            clientWs.send(
+              JSON.stringify({
+                type: "OPERATION",
+                userId: user.userId,
+                username: user.username,
+                operation: newOp,
+                serverVersion: session.version,
+              })
+            );
+          }
+        });
+      }
+
+      // -------- CURSOR --------
+      if (data.type === "CURSOR") {
+        const { documentId, position } = data;
+        const session = sessions[documentId];
+        if (!session) return;
+
+        const user = session.clients.get(ws);
+        if (!user) return;
+
+        session.clients.forEach((client, clientWs) => {
+          if (clientWs !== ws) {
+            clientWs.send(
+              JSON.stringify({
+                type: "CURSOR",
+                userId: user.userId,
+                username: user.username,
+                position,
+              })
+            );
+          }
+        });
+      }
+
+      // -------- LEAVE --------
+      if (data.type === "LEAVE") {
+        handleLeave(ws);
+      }
     } catch (err) {
       console.error("WebSocket error:", err);
     }
   });
 
   ws.on("close", () => {
-    const documentId = ws.documentId;
-    if (!documentId || !sessions[documentId]) return;
-
-    const user = sessions[documentId].clients.get(ws);
-    sessions[documentId].clients.delete(ws);
-
-    if (user) {
-      sessions[documentId].clients.forEach((_, clientWs) => {
-        clientWs.send(
-          JSON.stringify({
-            type: "USER_LEFT",
-            userId: user.userId,
-            username: user.username,
-          })
-        );
-      });
-    }
+    handleLeave(ws);
   });
 });
+
+// Handle leave
+function handleLeave(ws) {
+  const documentId = ws.documentId;
+  if (!documentId || !sessions[documentId]) return;
+
+  const session = sessions[documentId];
+  const user = session.clients.get(ws);
+
+  session.clients.delete(ws);
+
+  if (user) {
+    session.clients.forEach((client, clientWs) => {
+      clientWs.send(
+        JSON.stringify({
+          type: "USER_LEFT",
+          userId: user.userId,
+          username: user.username,
+        })
+      );
+    });
+  }
+
+  // Cleanup empty session
+  if (session.clients.size === 0) {
+    delete sessions[documentId];
+  }
+}
 
 // Start server
 initDB().then(() => {
