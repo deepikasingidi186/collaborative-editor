@@ -22,7 +22,7 @@ const pool = new Pool({
 const server = http.createServer(app);
 
 // Create WebSocket server
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ server, path: "/ws" });
 
 // In-memory sessions
 const sessions = {};
