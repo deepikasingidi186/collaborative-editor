@@ -149,46 +149,82 @@ wss.on("connection", (ws) => {
             content: result.rows[0].content,
             version: result.rows[0].version,
             clients: new Map(),
+            history: []
           };
         }
 
         // OPERATION
         if (data.type === "OPERATION") {
         const { documentId, userId, operation, clientVersion } = data;
-
         const session = sessions[documentId];
         if (!session) return;
 
-        let { content, version } = session;
+        let newOp = { ...operation };
 
-        // Basic OT: transform insert vs insert
-        if (clientVersion !== version) {
-            // For now simple shift logic
-            if (operation.type === "insert") {
-            // If server already has newer inserts before this position
-            if (operation.position > content.length) {
-                operation.position = content.length;
+        // Transform against operations that happened after clientVersion
+        for (let i = clientVersion; i < session.history.length; i++) {
+            const appliedOp = session.history[i];
+
+            // insert vs insert
+            if (newOp.type === "insert" && appliedOp.type === "insert") {
+            if (
+                newOp.position > appliedOp.position ||
+                (newOp.position === appliedOp.position &&
+                userId > appliedOp.userId)
+            ) {
+                newOp.position += appliedOp.text.length;
+            }
+            }
+
+            // insert vs delete
+            if (newOp.type === "insert" && appliedOp.type === "delete") {
+            if (newOp.position > appliedOp.position) {
+                newOp.position -= Math.min(
+                appliedOp.length,
+                newOp.position - appliedOp.position
+                );
+            }
+            }
+
+            // delete vs insert
+            if (newOp.type === "delete" && appliedOp.type === "insert") {
+            if (newOp.position >= appliedOp.position) {
+                newOp.position += appliedOp.text.length;
+            }
+            }
+
+            // delete vs delete
+            if (newOp.type === "delete" && appliedOp.type === "delete") {
+            if (newOp.position > appliedOp.position) {
+                newOp.position -= Math.min(
+                appliedOp.length,
+                newOp.position - appliedOp.position
+                );
             }
             }
         }
 
         // Apply operation
-        if (operation.type === "insert") {
-            content =
-            content.slice(0, operation.position) +
-            operation.text +
-            content.slice(operation.position);
+        if (newOp.type === "insert") {
+            session.content =
+            session.content.slice(0, newOp.position) +
+            newOp.text +
+            session.content.slice(newOp.position);
         }
 
-        if (operation.type === "delete") {
-            content =
-            content.slice(0, operation.position) +
-            content.slice(operation.position + operation.length);
+        if (newOp.type === "delete") {
+            session.content =
+            session.content.slice(0, newOp.position) +
+            session.content.slice(newOp.position + newOp.length);
         }
 
-        // Update session
-        session.content = content;
         session.version += 1;
+
+        // Save to history
+        session.history.push({
+            ...newOp,
+            userId,
+        });
 
         // Persist to DB
         await pool.query(
@@ -196,10 +232,9 @@ wss.on("connection", (ws) => {
             [session.content, session.version, documentId]
         );
 
-        // Get username
         const user = session.clients.get(ws);
 
-        // Broadcast to others
+        // Broadcast
         session.clients.forEach((client, clientWs) => {
             if (clientWs !== ws) {
             clientWs.send(
@@ -207,13 +242,13 @@ wss.on("connection", (ws) => {
                 type: "OPERATION",
                 userId: user.userId,
                 username: user.username,
-                operation,
+                operation: newOp,
                 serverVersion: session.version,
                 })
             );
             }
         });
-        }        
+        }       
 
         // Add client
         sessions[documentId].clients.set(ws, { userId, username });
