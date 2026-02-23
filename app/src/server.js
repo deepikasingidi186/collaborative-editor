@@ -152,6 +152,69 @@ wss.on("connection", (ws) => {
           };
         }
 
+        // OPERATION
+        if (data.type === "OPERATION") {
+        const { documentId, userId, operation, clientVersion } = data;
+
+        const session = sessions[documentId];
+        if (!session) return;
+
+        let { content, version } = session;
+
+        // Basic OT: transform insert vs insert
+        if (clientVersion !== version) {
+            // For now simple shift logic
+            if (operation.type === "insert") {
+            // If server already has newer inserts before this position
+            if (operation.position > content.length) {
+                operation.position = content.length;
+            }
+            }
+        }
+
+        // Apply operation
+        if (operation.type === "insert") {
+            content =
+            content.slice(0, operation.position) +
+            operation.text +
+            content.slice(operation.position);
+        }
+
+        if (operation.type === "delete") {
+            content =
+            content.slice(0, operation.position) +
+            content.slice(operation.position + operation.length);
+        }
+
+        // Update session
+        session.content = content;
+        session.version += 1;
+
+        // Persist to DB
+        await pool.query(
+            "UPDATE documents SET content = $1, version = $2 WHERE id = $3",
+            [session.content, session.version, documentId]
+        );
+
+        // Get username
+        const user = session.clients.get(ws);
+
+        // Broadcast to others
+        session.clients.forEach((client, clientWs) => {
+            if (clientWs !== ws) {
+            clientWs.send(
+                JSON.stringify({
+                type: "OPERATION",
+                userId: user.userId,
+                username: user.username,
+                operation,
+                serverVersion: session.version,
+                })
+            );
+            }
+        });
+        }        
+
         // Add client
         sessions[documentId].clients.set(ws, { userId, username });
         ws.documentId = documentId;
